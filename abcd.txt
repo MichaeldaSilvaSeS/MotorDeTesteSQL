@@ -1,0 +1,21 @@
+
+use master
+create database dbir
+use dbir
+
+use master
+go
+
+ sp_dboption dbir, 
+"select into/bulkcopy", true 
+go
+
+use master
+go
+
+checkpoint 
+go
+
+
+
+dump transaction dbir with no_log

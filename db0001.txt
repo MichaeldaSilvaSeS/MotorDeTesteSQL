@@ -1,0 +1,10 @@
+if exists (select 'X' from sysobjects where name = 'TBIR9950' and type  = 'U')
+begin
+	drop table TBIR9950
+end
+
+create table if not exists TBIR9950(
+	cod_err  int,
+	des_err varchar(30),
+	primary key(cod_err)
+)

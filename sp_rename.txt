@@ -1,0 +1,844 @@
+/* Sccsid = "%Z% generic/sproc/src/%M% %I% %G%" */
+/*	4.8	1.1	06/14/90	sproc/src/password */
+
+/*
+** Messages for "sp_rename"             17780
+**
+** 17260, "Can't run %1! from within a transaction."
+** 17460, "Object must be in the current database."
+** 17240, "'%1!' is not a valid name."
+** 17756, "The execution of the stored procedure '%1!' in database
+**         '%2!' was aborted because there was an error in writing the
+**         replication log record."
+** 17780, "There is already a column named '%1!' in table '%2!'."
+** 17781, "Column name has been changed."
+** 17782, "You do not own a table or column (or index) of that name in the current database."
+** 17783, "There is already an index named '%1!' for table '%2!'."
+** 17784, "Index name has been changed."
+** 17785, "Table or view names beginning with '#' are not allowed."
+** 17786, "Object name cannot be changed either because it does not exist in this database, or you don't own it, or it is a system name."
+** 17787, "Newname already exists in systypes."
+** 17788, "Newname already exists in sysobjects."
+** 17789, "Object name has been changed."
+** 17968, "The built-in function logschema() failed for '%1!'."
+** 18058, "Name of user-defined type name changed."
+** 18071, "Set curwrite to the level of table/column."
+** 18077, "Set curwrite to the level of index."
+** 18078, "Set curwrite to the level of the object in systypes."
+** 18079, "Set curwrite to the level of the object in sysobjects."
+** 18080, "Certified state of object '%1!' has been set to 'Suspect'"
+** 18409, "The built-in function getdbrepstat() failed. Please see 
+**         the other messages printed along with this message."
+** 18410, "The replication status of '%1!' is corrupt. Please contact 
+**         Sybase Technical Support."
+** 17325, "The length of input parameter '%1!' is longer than the permissible %2! characters."
+*/
+
+/*
+** IMPORTANT NOTE:
+** This stored procedure uses the built-in function object_id() in the
+** where clause of a select query. If you intend to change this query
+** or use the object_id() or db_id() builtin in this procedure, please read the
+** READ.ME file in the $DBMS/generic/sproc directory to ensure that the rules
+** pertaining to object-id's and db-id's outlined there, are followed.
+*/
+
+create procedure sp_rename
+@objname varchar(62),			/* old (current) object name */
+@newname varchar(31),			/* new name we want to call it */
+@indorcol varchar(10) = null		/* Index or column to rename */
+as
+
+declare @objid int			/* object id of the thing to rename */
+declare @index_objid int		/* object id from sysindexes */
+declare @msg varchar(1024)
+declare @temp_dbid	int
+declare @temp_objid	int
+declare @curdb_name	varchar(30)	/* name of current db */
+declare @rep_constant	smallint	/* bit indicating a repl. object */
+declare @cur_sysstat	smallint	/* current sysstat value of object */
+declare @rep_obj	int		/* is the object replicated? */
+declare @rep_db_stat	int		/* rep status of database */
+declare @rep_db		int		/* is the db replicated */
+declare @table_or_proc	int		/* object is a table or procedure */
+declare @obj_type	char(2)		/* type of the object */
+declare @user_tran	int		/* inside a user tran? */
+declare @after_image	int		/* log the after image of the schema */
+declare @mod_versionts	int		/* modify version timestamp after
+					** logging the schema
+					*/
+declare @dbname varchar(30)
+
+
+
+/*
+** Initialise objid and index_objid
+*/
+select @objid = NULL
+select @index_objid = NULL
+
+/* check the lenghts of the input params */
+if char_length(@objname) > 61
+begin
+        /*
+        ** 17325, "The length of input parameter '%1!' is longer than the permissible %2! characters."
+        */
+        raiserror 17325, @objname, 61
+        return (1)
+end
+if char_length(@newname) > 30
+begin
+        /*
+        ** 17325, "The length of input parameter '%1!' is longer than the permissible %2! characters."
+        */
+        raiserror 17325, @newname, 30
+        return (1)
+end
+if (@indorcol not in (null, 'index', 'column'))
+begin
+	/*
+	** 18938, "Invalid third argument '%1!' entered. Valid values are 
+	** {'index'|'column'}"
+	*/
+	raiserror 18938, @indorcol
+	return (1)
+end
+
+/*
+** Running sp_rename inside a transaction would endanger the
+** recoverability of the transaction/database. Disallow it.
+*/
+
+if @@trancount > 0
+begin
+	/*
+	** 17260, "Can't run %1! from within a transaction."
+	*/
+	raiserror 17260, "sp_rename"
+	return (1)
+end
+
+set chained off
+set transaction isolation level 1
+
+if @objname like "%.%.%"
+begin
+	/*
+	** 17460, "Object must be in the current database."
+	*/
+	raiserror 17460
+	return (1)
+end
+
+/*
+**  Check to see that the @newname is valid.
+*/
+if valid_name(@newname) = 0
+begin
+	/*
+	** 17240, "'%1!' is not a valid name."
+	*/
+	raiserror 17240, @newname
+	return (1)
+end
+
+/*
+**  Check to see if we are renaming a table/column (or table/index)
+**  or a table or usertype.
+**  If @objname is of the form table.column then it's a column.
+**  In the column case, we need to extract and verify the table and
+**  column names and make sure the user owns the table that is getting
+**  the rule bound.
+*/
+if @objname like "%.%"
+begin
+	declare @tabname varchar(30)		/* name of table */
+	declare @colname varchar(30)		/* name of column */
+	declare @colid smallint			/* colid of the column */
+
+	/*
+	**  Get the table name out.
+	*/
+	select @tabname = substring(@objname, 1, charindex(".", @objname) - 1)
+	select @colname = substring(@objname, charindex(".", @objname) + 1, 61)
+
+	/*
+	**  If no third parameter was specified, or, if third parameter
+	**  was specified as 'index', see if there is an index
+	**  of this name in a table owned by the user, and keep it in a 
+	**  local variable.
+	*/
+	if (@indorcol in (null, 'index'))
+	begin
+
+
+		select @index_objid = sysindexes.id, @colid = sysindexes.indid
+
+			from sysobjects, sysindexes
+		where sysindexes.id = sysobjects.id
+			and sysobjects.name = @tabname
+			and sysindexes.name = @colname
+			and sysindexes.indid != 0
+			and sysobjects.sysstat & 7 = 3	/* user table */
+			and sysobjects.uid = user_id()
+
+	end
+
+	/*
+	**  Now check to see that the column exists in a table owned
+	**  by the user. Don't do this if the user explicitly specified
+	**  that this is an index.
+	*/
+
+	if (@indorcol != 'index')
+	begin
+
+
+		select @objid = syscolumns.id, @colid = syscolumns.colid
+
+			from sysobjects, syscolumns
+		where syscolumns.id = sysobjects.id
+			and sysobjects.name = @tabname
+			and syscolumns.name = @colname
+			and (sysobjects.sysstat & 7 = 2		/* user table */
+			or sysobjects.sysstat & 7 = 3)		/* view */
+			and sysobjects.uid = user_id()
+	end
+
+	/*
+	**  Did we find it?  If not, it might be an index name so we'll
+	**  check in the next case. If the user explicitly specified 
+	**  that this is an index name, check in the next case as well.
+	*/
+	if @objid is not  null
+	begin
+		/*
+		**  If there is an index as well as a column of the same
+		**  name, raise an error to warn the user of this ambiguity.
+		*/
+		if @index_objid is not null
+		begin
+			/*
+			** 18939, "There is an index as well as a column of
+			** the name '%1!'. Please specify as the third 
+			** argument whether you would like to rename 'index' 
+			** or 'column'"
+			*/
+			raiserror 18939, @colname
+			return (1)
+		end
+
+		/*
+		**  Check to make sure that there is no already a column
+		**  that has the new name.
+		*/
+		if exists (select *
+				from syscolumns
+					where id = @objid
+						and name = @newname)
+		begin
+			/*
+			** 17780, "There is already a column named '%1!' in table '%2!'."
+			*/
+			raiserror 17780, @newname, @tabname
+			return (1)
+		end
+
+
+
+		/* determine the object's replication status */
+
+		/* Replication enabled flag is 8000H (which is -32768D) */
+		select @rep_constant = -32768
+
+		select
+			@cur_sysstat = sysstat
+		from
+			sysobjects holdlock
+		where
+			id = @objid
+
+		if (@cur_sysstat & @rep_constant) = @rep_constant
+		begin
+			select @rep_obj = 1
+		end
+		else
+		begin
+			select @rep_obj = 0
+		end
+
+		/* determine the database's replication status */
+		select @rep_db_stat = getdbrepstat()
+
+		if (@rep_db_stat < -1)
+		begin
+        		/*
+        		** 18409, "The built-in function getdbrepstat() 
+			** failed. Please see the other messages printed 
+			** along with this message."
+        		*/
+				raiserror 18409
+        		return (1)
+		end
+		else if (@rep_db_stat > 1)
+		begin
+        		/*
+        		** 18410, "The replication status of '%1!' is 
+			** corrupt. Please contact Sybase Technical 
+			** Support."
+        		*/
+			select @curdb_name = db_name()
+				raiserror 18410, @curdb_name
+        		return (1)
+		end       
+		else
+		begin
+			if (@rep_db_stat != 0)
+				select @rep_db = 1
+			else
+				select @rep_db = 0
+		end
+
+		/*
+		** IMPORTANT: The name rs_logexec is significant
+		** and is used by Replication Server. 
+		*/
+		begin transaction rs_logexec
+
+		/* if the object is replicated, log the schema before 
+		** changing the column name
+		*/
+		if ((@rep_obj = 1) or (@rep_db = 1))
+		begin
+			select @user_tran = 0
+			select @after_image = 0
+			select @mod_versionts = 1
+			if (logschema(@objid, @user_tran, @after_image, 
+					@mod_versionts) != 1)
+			begin
+				/*
+				** 17968 "The built-in function logschema() 
+				** failed for '%1!'."
+				*/
+				raiserror 17968, @tabname
+
+				rollback transaction rs_logexec
+				return(1)
+			end
+		end 
+
+		/*
+		**  Go ahead and change the column name.
+		*/
+		update syscolumns
+			set name = @newname
+				from syscolumns
+			where id = @objid
+				and colid = @colid
+		/*
+		** If we are renaming the SYB_IDENTITY_COL
+		** then turn off the COL_AUTO_IDENTITY bit (0x2).
+		** Note that we can never rename a column to
+		** SYB_IDENTIY_COL (since valid_name() will fail)
+		** so don't worry about the converse.
+		*/
+		if (@colname = "SYB_IDENTITY_COL")
+		begin
+			update syscolumns
+				set status = (~2 & status)
+					from syscolumns
+				where id = @objid
+					and colid = @colid
+		end
+
+		/*
+		** Write the log record to replicate this invocation 
+		** of the stored procedure.
+		*/
+		if (logexec() != 1)
+		begin
+			/*
+			** 17756, "The execution of the stored procedure '%1!'
+			** 	   in database '%2!' was aborted because there
+			** 	   was an error in writing the replication log
+			**	   record."
+			*/
+			select @dbname = db_name()
+			raiserror 17756, "sp_rename", @dbname
+				
+			rollback transaction rs_logexec
+			return(1)
+		end
+
+		/* commit the transaction */
+		commit transaction
+
+		/*
+		** 17781, "Column name has been changed."
+		*/
+		exec sp_getmessage 17781, @msg output
+		print @msg
+		return (0)
+	end
+
+	/*
+	**  Might be an index name.
+	*/
+	else
+	begin
+		/*
+		**  We have already obtained the objid from sysindexes.
+		*/
+		select @objid = @index_objid
+
+		/*
+		**  If @objid is still NULL then that means it isn't an
+		**  index name.  We checked above to see if it was a column
+		**  name so now it's time to give up.
+		*/
+		if @objid is null
+		begin
+			/*
+			** 17782, "You do not own a table or column (or index) of that name in the current database."
+			*/
+			raiserror 17782
+			return (1)
+		end
+
+		/*
+		**  Check to make sure that there is no already an index
+		**  that has the new name.
+		*/
+		if exists (select *
+				from sysindexes
+					where id = @objid
+						and name = @newname)
+		begin
+			/*
+			** 17783, "There is already an index named '%1!' for table '%2!'."
+			*/
+			raiserror 17783, @newname, @tabname
+			return (1)
+		end
+
+
+
+		/*
+		** IMPORTANT: The name rs_logexec is significant
+		** and is used by Replication Server. 
+		*/
+		begin transaction rs_logexec
+
+		/*
+		**  Go ahead and change the index name.
+		*/
+		update sysindexes
+			set name = @newname
+				from sysindexes
+			where id = @objid
+				and indid = @colid
+
+		/*
+		** We updated a sysindexes row. We also need to update the
+		** in-core structure representing this sysindexes row as the
+		** sysindexes rows cache is not a write thru cache. 
+		*/ 
+		select @temp_dbid = db_id()
+
+		dbcc refreshides(@temp_dbid, @objid, @colid)
+		
+		/* 
+		** If there was a error in rollback the update to sysindexes.
+		** dbcc refreshides would have printed the error message.
+		*/
+		if @@error != 0
+		begin
+			rollback transaction rs_logexec
+			return (1)
+		end
+
+		/*
+		** Write the log record to replicate this invocation 
+		** of the stored procedure.
+		*/
+		if (logexec() != 1)
+		begin
+			/*
+			** 17756, "The execution of the stored procedure '%1!'
+			** 	   in database '%2!' was aborted because there
+			** 	   was an error in writing the replication log
+			**	   record."
+			*/
+			select @dbname = db_name()
+			raiserror 17756, "sp_rename", @dbname
+				
+			rollback transaction rs_logexec
+			return(1)
+		end
+
+		commit transaction 
+		/*
+		** 17784, "Index name has been changed."
+		*/
+		exec sp_getmessage 17784, @msg output
+		print @msg
+		return (0)
+	end
+end
+
+/*
+**  Check to see if the object exists and is owned by the user.
+**  It will either be in the sysobjects table or the systypes table.
+**  Check sysobjects first.
+**  System objects have ids < 100 and we don't allow their names to change.
+*/
+if exists (select id
+	from sysobjects
+		where id = object_id(@objname)
+			and uid = user_id()
+			and id > 99)
+/*
+**  Don't allow the newname to begin with #.
+*/
+begin
+	if substring(@newname, 1, 1) = "#"
+	begin
+		/*
+		** 17785, "Table or view names beginning with '#' are not allowed."
+		*/
+		raiserror 17785
+		return (1)
+	end
+
+end
+
+/*
+**  It's not in sysobjects so check systypes.
+*/
+else
+begin
+
+
+	select @objid = usertype
+
+		from systypes
+			where name = @objname
+				and uid = user_id()
+				and usertype > 99
+
+	/*
+	**  It's nowhere to be found so quit.
+	*/
+	if @objid is NULL
+	begin
+		/*
+		** 17786, "Object name cannot be changed either because it does not exist in this database, or you don't own it, or it is a system name."
+		*/
+		raiserror 17786
+		return (1)
+	end
+
+
+	/* Check that newname doesn't already exist. */
+	if exists (select *
+			from systypes
+				where name = @newname)
+	begin
+		/*
+		** 17787, "Newname already exists in systypes."
+		*/
+		raiserror 17787
+		return (1)
+	end
+
+
+	/*
+	** IMPORTANT: This transaction name is significant and is used by
+	**            Replication Server
+	*/
+	begin transaction rs_logexec
+	
+		/*
+		** Change the name of a datatype
+		*/
+		update systypes
+			set name = @newname
+			where usertype = @objid
+
+		/*
+		** Write the log record to replicate this invocation 
+		** of the stored procedure.
+		*/
+		if (logexec() != 1)
+		begin
+			/*
+			** 17756, "The execution of the stored procedure '%1!'
+			** 	   in database '%2!' was aborted because there
+			** 	   was an error in writing the replication log
+			**	   record."
+			*/
+			select @dbname = db_name()
+			raiserror 17756, "sp_setreptable", @dbname
+				
+			rollback transaction rs_logexec
+			return(1)
+		end
+	commit transaction
+
+	/*
+	** 18058, "Name of user-defined type name changed."
+	*/
+	exec sp_getmessage 18058, @msg output
+	print @msg
+	return (0)
+end
+
+/*
+**  It might be a table so update the index entry for the table IF it has
+**  no clustered index.  No clustered index means that there is an entry
+**  for the table under the @objid with indid = 0.
+*/
+
+/* Check that newname doesn't already exist. */
+if exists (select *
+		from sysobjects
+			where name = @newname
+			and uid = user_id())
+begin
+	/*
+	** 17788, "Newname already exists in sysobjects."
+	*/
+	raiserror 17788
+	return (1)
+end
+
+
+
+/*
+** IMPORTANT: This transaction name is significant and is used by
+**            Replication Server
+*/
+begin transaction rs_logexec
+
+	/* if the object is a table or a procedure, we may have to log its
+	** schema before/after changing its name
+	*/
+	if exists (
+		    select id 
+		    from sysobjects where
+			(type = "U" or type = "P") and 
+			id = object_id(@objname)
+		  )
+	begin
+		select @table_or_proc = 1
+	end
+	else
+	begin
+		select @table_or_proc = 0
+	end
+
+	/* determine the object's replication status if it is a table or
+	** a procedure and log its schema if necessary
+	*/
+	if (@table_or_proc = 1)
+	begin
+
+		/* Replication enabled flag is 8000H (which is -32768D) */
+		select @rep_constant = -32768
+
+		select
+			@cur_sysstat = sysstat
+		from
+			sysobjects holdlock
+		where
+			id = object_id(@objname) 
+
+		if (@cur_sysstat & @rep_constant) = @rep_constant
+		begin
+			select @rep_obj = 1
+		end
+		else
+		begin
+			select @rep_obj = 0
+		end
+
+		/* check if db is replicated */
+		select @rep_db_stat = getdbrepstat()
+		if (@rep_db_stat < -1)
+		begin
+        		/*
+        		** 18409, "The built-in function getdbrepstat() 
+			** failed. Please see the other messages printed 
+			** along with this message."
+        		*/
+			raiserror 18409
+			rollback transaction rs_logexec
+        		return (1)
+		end
+		else if (@rep_db_stat > 1)
+		begin
+        		/*
+        		** 18410, "The replication status of '%1!' is 
+			** corrupt. Please contact Sybase Technical 
+			** Support."
+        		*/
+			select @curdb_name = db_name()
+        		raiserror 18410, @curdb_name
+			rollback transaction rs_logexec
+        		return (1)
+		end       
+		else
+		begin
+			if (@rep_db_stat != 0)
+				select @rep_db = 1
+			else
+				select @rep_db = 0
+		end
+
+		/*
+		** if db is replicated, and object is user table, then the
+		** user table is replicated even if it is not explicitly
+		** marked for replication
+		*/
+		if ((@rep_obj = 0) and (@rep_db = 1))
+		begin
+			if exists (
+				select id from
+					sysobjects where
+					(type = "U") and
+					(id = object_id(@objname))
+				  )
+			begin
+				select @rep_obj = 1
+			end
+		end
+
+		if (@rep_obj = 1)
+		begin
+			select @user_tran = 0
+			select @after_image = 0
+			select @mod_versionts = 1
+			if (logschema(object_id(@objname), @user_tran, 
+					@after_image, @mod_versionts) != 1)
+			begin
+				/*
+				** 17968 "The built-in function logschema() 
+				** failed for '%1!'."
+				*/
+				raiserror 17968, @objname
+
+				rollback transaction rs_logexec
+				return(1)
+			end
+		end
+	end
+
+	update sysobjects
+		set name = @newname
+			where id = object_id(@objname)
+
+	/*
+	** If the object is a proxy table, update sysattributes
+	*/
+        update sysattributes
+                set object_cinfo = @newname
+                        where object_cinfo = @objname and class = 9
+
+ 
+	 /*
+	 **  This might not do anything -- only if we are dealing with a
+	 **  table that has no clustered index.
+	 **  Also change the name of the text entry, if any.
+	 */
+	 update sysindexes
+		set name = @newname
+			where id = object_id(@objname)
+				and indid = 0
+
+	/*
+	** We updated a sysindexes row. We also need to update the
+	** in-core structure representing this sysindexes row as the
+	** sysindexes rows cache is not a write thru cache. 
+	*/ 
+	select @temp_dbid = db_id()
+	select @temp_objid = object_id(@objname)
+
+	dbcc refreshides(@temp_dbid, @temp_objid, 0)
+
+	/* dbcc refreshides would print a message in case of error */
+	if @@error != 0
+	begin
+		rollback transaction rs_logexec
+		return (1)
+	end
+
+	update sysindexes
+		set name = "t" + @newname
+			where id = object_id(@objname)
+				and indid = 255
+
+	/*
+	** We updated a sysindexes row. We also need to update the
+	** in-core structure representing this sysindexes row as the
+	** sysindexes rows cache is not a write thru cache. 
+	*/ 
+	dbcc refreshides(@temp_dbid, @temp_objid, 255)
+
+	/* dbcc refreshides would print a message in case of error */
+	if @@error != 0
+	begin
+		rollback transaction rs_logexec
+		return (1)
+	end
+
+	/*
+	**	We also must update the object name in the descriptor
+	**	otherwise, in the cache, the object would be under the
+	**	old name.
+	*/
+	dbcc chgobjname(@objname, @newname)
+
+	if @@error != 0
+	begin
+		rollback transaction rs_logexec
+		return (1)
+	end
+
+	/*
+	** Write the log record to replicate this invocation 
+	** of the stored procedure.
+	*/
+	if (logexec() != 1)
+	begin
+		/*
+		** 17756, "The execution of the stored procedure '%1!'
+		** 	   in database '%2!' was aborted because there
+		** 	   was an error in writing the replication log
+		**	   record."
+		*/
+		select @dbname = db_name()
+		raiserror 17756, "sp_rename", @dbname
+				
+		rollback transaction rs_logexec
+		return (1)
+	end
+
+commit transaction
+
+/*
+** 17789, "Object name has been changed."
+*/
+exec sp_getmessage 17789, @msg output
+print @msg
+
+
+return (0)
+
+GO
+
+sp_procxmode dbo.sp_rename, anymode
+GO
+
+GRANT EXECUTE ON dbo.sp_rename TO public
+GO
+
